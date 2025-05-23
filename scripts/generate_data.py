@@ -1,0 +1,699 @@
+"""
+Mock data generation module using SDV to create realistic, constraint-respecting data.
+
+This module uses the Synthetic Data Vault (SDV) library to learn patterns from
+existing data and generate new synthetic data that respects schema constraints,
+primary/foreign keys, and uniqueness requirements.
+"""
+
+import os
+import argparse
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Set, Any, Tuple, Optional
+from sdv.single_table import GaussianCopulaSynthesizer
+from sdv.constraints import FixedCombinations
+from tqdm import tqdm
+import logging
+import random
+import string
+import re
+import datetime
+import pickle
+
+from extract_schema import (
+    get_connection,
+    get_table_schema,
+    get_primary_keys,
+    get_foreign_keys,
+    get_table_data_sample,
+    analyze_pk_patterns
+)
+from load_config import (
+    load_target_tables,
+    load_fk_mappings,
+    load_unique_constraints,
+    load_table_hierarchy,
+    determine_generation_order
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class DataGenerator:
+    """Class for generating realistic mock data based on schema and patterns."""
+    
+    def __init__(self, config_dir: str):
+        """
+        Initialize the data generator.
+        
+        Args:
+            config_dir: Directory containing configuration Excel files
+        """
+        self.config_dir = config_dir
+        self.engine = get_connection()
+        
+        # Load configuration files
+        self.target_tables = load_target_tables(os.path.join(config_dir, 'target_tables.xlsx'))
+        self.fk_mappings = load_fk_mappings(os.path.join(config_dir, 'fk_mappings.xlsx'))
+        self.unique_constraints = load_unique_constraints(os.path.join(config_dir, 'unique_constraints.xlsx'))
+        
+        # Load table hierarchy if available
+        try:
+            self.table_hierarchy = load_table_hierarchy(os.path.join(config_dir, 'table_hierarchy.xlsx'))
+        except Exception:
+            logger.warning("Table hierarchy file not found or invalid. Using FK-based ordering.")
+            self.table_hierarchy = None
+        
+        # Determine generation order
+        self.generation_order = determine_generation_order(
+            self.target_tables, 
+            self.fk_mappings, 
+            self.table_hierarchy
+        )
+        
+        # Store schema information and generated data
+        self.table_schemas = {}
+        self.primary_keys = {}
+        self.foreign_keys = {}
+        self.pk_patterns = {}
+        self.data_samples = {}
+        self.generated_data = {}
+        self.all_unique_values = {}
+        
+    def load_schemas(self):
+        """Load schema information for all target tables."""
+        for table_name in self.generation_order:
+            logger.info(f"Loading schema for table: {table_name}")
+            
+            # Get table schema
+            self.table_schemas[table_name] = get_table_schema(self.engine, table_name)
+            
+            # Get primary keys
+            self.primary_keys[table_name] = get_primary_keys(self.engine, table_name)
+            
+            # Get foreign keys
+            self.foreign_keys[table_name] = get_foreign_keys(self.engine, table_name)
+            
+            # Get sample data for learning patterns
+            self.data_samples[table_name] = get_table_data_sample(self.engine, table_name)
+            
+            # Analyze primary key patterns
+            if self.primary_keys[table_name]:
+                self.pk_patterns[table_name] = analyze_pk_patterns(
+                    self.data_samples[table_name], 
+                    self.primary_keys[table_name]
+                )
+            
+            # Initialize storage for unique values
+            for col in self.table_schemas[table_name]['column_name']:
+                self.all_unique_values[(table_name, col)] = set()
+                
+                # Add existing values from sample data to track uniqueness
+                if col in self.data_samples[table_name].columns:
+                    self.all_unique_values[(table_name, col)].update(
+                        self.data_samples[table_name][col].dropna().unique()                    )
+    
+    def generate_all_data(self):
+        """Generate mock data for all tables in the correct order."""
+        for table_name in tqdm(self.generation_order, desc="Generating Tables"):
+            logger.info(f"Generating data for table: {table_name}")
+            
+            # Get number of records to generate
+            num_records = self.target_tables.loc[
+                self.target_tables['TableName'] == table_name, 'NumRecords'
+            ].iloc[0]
+            
+            # Generate data for this table
+            self.generated_data[table_name] = self.generate_table_data(table_name, int(num_records))
+            
+            # Update unique value tracking for this table
+            for col in self.generated_data[table_name].columns:
+                if (table_name, col) in self.all_unique_values:
+                    self.all_unique_values[(table_name, col)].update(
+                        self.generated_data[table_name][col].dropna().unique()
+                    )
+    
+    def generate_table_data(self, table_name: str, num_records: int) -> pd.DataFrame:
+        """
+        Generate synthetic data for a specific table.
+        
+        Args:
+            table_name: Name of the table to generate data for
+            num_records: Number of records to generate
+            
+        Returns:
+            DataFrame containing the generated data
+        """
+        # Get schema information
+        schema_df = self.table_schemas[table_name]
+        pk_columns = self.primary_keys[table_name]
+        sample_data = self.data_samples[table_name].copy()
+        
+        # Convert data types to ensure numeric columns are properly processed
+        for _, col_info in schema_df.iterrows():
+            column_name = col_info['column_name']
+            data_type = col_info['data_type']
+            
+            # Skip if column not in sample_data
+            if column_name not in sample_data.columns:
+                continue
+                
+            # Convert numeric types to appropriate data types
+            if data_type in ('int', 'bigint', 'smallint', 'tinyint'):
+                # Try to convert to numeric, but handle errors gracefully
+                try:
+                    sample_data[column_name] = pd.to_numeric(sample_data[column_name], errors='coerce')
+                except:
+                    logger.warning(f"Could not convert column {column_name} to numeric")
+            elif data_type in ('decimal', 'numeric', 'float', 'real', 'money'):
+                try:
+                    sample_data[column_name] = pd.to_numeric(sample_data[column_name], errors='coerce')
+                except:
+                    logger.warning(f"Could not convert column {column_name} to float")
+        
+        # Setup SDV synthesizer with appropriate metadata
+        metadata = self._create_metadata(table_name, schema_df)
+        
+        # Update metadata with constraints
+        self._create_constraints(table_name, metadata)
+        
+        # For SDV 1.12.0, we need to use the updated API
+        from sdv.single_table import GaussianCopulaSynthesizer
+        
+        synthesizer = GaussianCopulaSynthesizer(
+            metadata=metadata
+        )
+          # Fit the model on sample data
+        logger.info(f"Training synthesizer on {len(sample_data)} samples for table: {table_name}")
+        synthesizer.fit(sample_data)
+        
+        # Generate initial synthetic data
+        logger.info(f"Generating {num_records} records for table: {table_name}")
+        synthetic_data = synthesizer.sample(num_records)
+        
+        # Post-process to ensure all constraints are met
+        processed_data = self._post_process_data(table_name, synthetic_data)
+        
+        return processed_data
+    
+    def _create_metadata(self, table_name: str, schema_df: pd.DataFrame) -> Dict[str, Any]:
+        """Create metadata dictionary for SDV based on table schema."""
+        # For SDV 1.12.0, we need to use the SDV SingleTableMetadata class
+        from sdv.metadata import SingleTableMetadata
+        
+        metadata = SingleTableMetadata()
+        
+        # Get primary keys for special handling
+        pk_columns = set(self.primary_keys[table_name])
+        # First pass: Add all columns with their proper SDV types based on schema
+        for _, row in schema_df.iterrows():
+            column_name = row['column_name']
+            data_type = row['data_type']
+            
+            # Map SQL Server types to SDV types
+            if column_name in pk_columns:
+                # For primary keys, just mark as id without additional parameters
+                # SDV 1.12.0 doesn't support computer_representation for 'id' type anymore
+                metadata.add_column(column_name, sdtype='id')
+            elif data_type in ('int', 'bigint', 'smallint', 'tinyint'):
+                metadata.add_column(column_name, sdtype='numerical', computer_representation='Int64')
+            elif data_type in ('decimal', 'numeric', 'float', 'real', 'money'):
+                metadata.add_column(column_name, sdtype='numerical', computer_representation='Float')
+            elif data_type in ('date', 'datetime', 'datetime2', 'smalldatetime'):
+                metadata.add_column(column_name, sdtype='datetime')
+            elif data_type in ('bit'):
+                metadata.add_column(column_name, sdtype='boolean')
+            elif data_type in ('char', 'varchar', 'nchar', 'nvarchar'):                # Handle string types with length information if available
+                max_length = row.get('max_length', 0)
+                if data_type.startswith('n'):  # Unicode strings
+                    max_length = max_length // 2
+                # Just add as categorical, we'll handle length constraints in post-processing
+                metadata.add_column(column_name, sdtype='categorical')
+            else:
+                metadata.add_column(column_name, sdtype='categorical')
+        
+        # After registering all columns, now set the primary key
+        for pk in pk_columns:
+            metadata.set_primary_key(pk)
+            
+        return metadata
+    
+    def _create_constraints(self, table_name: str, metadata) -> None:
+        """Update metadata with foreign key relationships for SDV 1.12.0."""
+        # Add foreign key constraints from database schema
+        fk_df = self.foreign_keys[table_name]
+        for _, row in fk_df.iterrows():
+            parent_table = row['parent_table']
+            parent_column = row['parent_column']
+            child_column = row['child_column']
+            
+            # Only add constraint if parent table has been generated
+            if parent_table in self.generated_data:
+                logger.info(f"Foreign key relationship: {table_name}.{child_column} -> {parent_table}.{parent_column}")
+                # Note this relationship for post-processing
+                if not hasattr(self, 'fk_relationships'):
+                    self.fk_relationships = []
+                self.fk_relationships.append({
+                    'child_table': table_name,
+                    'child_column': child_column,
+                    'parent_table': parent_table,
+                    'parent_column': parent_column
+                })
+        
+        # Add constraints from additional FK mappings
+        additional_fks = self.fk_mappings[
+            (self.fk_mappings['ChildTable'] == table_name)
+        ]
+        
+        for _, row in additional_fks.iterrows():
+            parent_table = row['ParentTable']
+            parent_column = row['ParentColumn']
+            child_column = row['ChildColumn']
+            # Only add constraint if parent table has been generated
+            if parent_table in self.generated_data:
+                logger.info(f"Additional FK relationship: {table_name}.{child_column} -> {parent_table}.{parent_column}")
+                # No fk_relationships logic here; just log or update metadata if needed
+        
+    def _post_process_data(self, table_name: str, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Post-process generated data to ensure all constraints are met.
+        
+        This includes:
+        - Ensuring primary keys are unique
+        - Respecting column length limits
+        - Handling special column types
+        - Enforcing additional uniqueness constraints
+        - Removing the IsMock column if present
+        """
+        # Make a copy to avoid modifying the original
+        processed_data = data.copy()
+        
+        # Remove IsMock column if it exists
+        if 'IsMock' in processed_data.columns:
+            logger.info(f"Removing IsMock column from table: {table_name}")
+            processed_data = processed_data.drop(columns=['IsMock'])
+            
+        schema_df = self.table_schemas[table_name]
+        pk_columns = self.primary_keys[table_name]
+        
+        # Process each column
+        for _, col_info in schema_df.iterrows():
+            column_name = col_info['column_name']
+            
+            # Skip if column not in generated data
+            if column_name not in processed_data.columns:
+                continue
+            
+            # Handle primary key columns
+            if column_name in pk_columns:
+                processed_data = self._ensure_unique_primary_key(
+                    table_name, 
+                    processed_data, 
+                    column_name
+                )
+            
+            # Handle string length constraints
+            if col_info['data_type'] in ('char', 'varchar', 'nchar', 'nvarchar'):
+                max_length = col_info['max_length']
+                # For nchar/nvarchar, the length is in bytes, but each character takes 2 bytes
+                if col_info['data_type'] in ('nchar', 'nvarchar'):
+                    max_length = max_length // 2
+                    
+                processed_data = self._enforce_string_length(
+                    processed_data, 
+                    column_name, 
+                    max_length
+                )
+            
+            # Handle additional uniqueness constraints
+            unique_cols = self.unique_constraints[
+                (self.unique_constraints['TableName'] == table_name) & 
+                (self.unique_constraints['ColumnName'] == column_name)
+            ]
+            
+            if not unique_cols.empty:
+                processed_data = self._ensure_unique_values(
+                    table_name,
+                    processed_data,
+                    column_name
+                )
+        
+        # Handle foreign key relationships
+        processed_data = self._enforce_foreign_keys(table_name, processed_data)
+        
+        return processed_data
+    
+    def _ensure_unique_primary_key(
+        self, 
+        table_name: str, 
+        data: pd.DataFrame, 
+        column_name: str
+    ) -> pd.DataFrame:
+        # Ensure PKs are unique across both sample and generated data, and respect max_length
+        result_data = data.copy()
+        pattern = self.pk_patterns[table_name].get(column_name, 'unknown')
+        # Get max_length for this PK column from schema
+        schema_df = self.table_schemas[table_name]
+        col_info = schema_df[schema_df['column_name'] == column_name].iloc[0]
+        max_length = col_info.get('max_length', None)
+        if col_info['data_type'] in ('nchar', 'nvarchar') and max_length:
+            max_length = max_length // 2
+        # Combine all unique values from sample and generated data
+        existing_values = set(self.data_samples[table_name][column_name].dropna().unique())
+        existing_values.update(self.all_unique_values.get((table_name, column_name), set()))
+        for idx in result_data.index:
+            current_value = result_data.at[idx, column_name]
+            if pd.isna(current_value) or current_value in existing_values or (max_length and isinstance(current_value, str) and len(current_value) > max_length):
+                # Generate new value based on pattern and max_length
+                if pattern == 'numeric' and pd.api.types.is_numeric_dtype(result_data[column_name].dtype):
+                    max_val = max([v for v in existing_values if isinstance(v, (int, float))], default=0)
+                    new_value = int(max_val) + 1
+                else:
+                    # For string PKs, generate a unique value that fits max_length
+                    prefix = ''
+                    suffix_len = max_length if max_length else 8
+                    # Try to use a prefix if pattern is prefixed_*
+                    if pattern.startswith('prefixed_'):
+                        prefix = pattern.split('_', 1)[1]
+                        suffix_len = max((max_length or 8) - len(prefix), 1)
+                    elif pattern == 'unknown' and max_length:
+                        prefix = ''
+                        suffix_len = max_length
+                    else:
+                        # Use table abbreviation as prefix if possible
+                        prefix = table_name[:3]
+                        suffix_len = max((max_length or 8) - len(prefix), 1)
+                    tries = 0
+                    while True:
+                        # Use digits for suffix if possible, else alphanum
+                        if suffix_len > 0:
+                            if tries < 10000:
+                                suffix = ''.join(random.choices(string.digits, k=suffix_len))
+                            else:
+                                suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=suffix_len))
+                        else:
+                            suffix = ''
+                        new_value = f"{prefix}{suffix}"[:max_length] if max_length else f"{prefix}{suffix}"
+                        if new_value not in existing_values and (not max_length or len(new_value) <= max_length):
+                            break
+                        tries += 1
+                        if tries > 100000:
+                            raise Exception(f"Could not generate unique PK for {table_name}.{column_name} within max_length {max_length}")
+                result_data.at[idx, column_name] = new_value
+                existing_values.add(new_value)
+        self.all_unique_values[(table_name, column_name)] = existing_values
+        return result_data
+
+    def _enforce_string_length(
+        self, 
+        data: pd.DataFrame, 
+        column_name: str, 
+        max_length: int
+    ) -> pd.DataFrame:
+        """Ensure string values in a column do not exceed the specified max_length."""
+        result_data = data.copy()
+        if column_name not in result_data.columns:
+            return result_data
+        # Only truncate non-null values
+        mask = result_data[column_name].notna()
+        result_data.loc[mask, column_name] = result_data.loc[mask, column_name].astype(str).str.slice(0, max_length)
+        return result_data
+
+    def _enforce_foreign_keys(self, table_name: str, data: pd.DataFrame) -> pd.DataFrame:
+        """Ensure foreign key values reference only generated parent keys, supporting composite keys and descriptive mappings from fk_mappings.xlsx."""
+        result_data = data.copy()
+        fk_relationships = []
+        fk_df = self.foreign_keys[table_name]
+        for _, row in fk_df.iterrows():
+            fk_relationships.append({
+                'parent_table': row['parent_table'],
+                'parent_column': [row['parent_column']],
+                'child_column': [row['child_column']]            })
+        
+        # Add additional FK mappings, including descriptive mappings
+        additional_fks = self.fk_mappings[
+            (self.fk_mappings['ChildTable'] == table_name)
+        ]
+        for _, row in additional_fks.iterrows():
+            parent_table = row['ParentTable']
+            parent_column = row['ParentColumn']
+            child_column = row['ChildColumn']
+            parent_key = row.get('ParentKey') or row.get('parentKey')
+            child_key = row.get('ChildKey') or row.get('childKey')
+            rel = {
+                'parent_table': parent_table,
+                'parent_column': [parent_column],
+                'child_column': [child_column]
+            }
+            # Only add key mappings if both keys are valid strings
+            if parent_key and child_key and isinstance(parent_key, str) and isinstance(child_key, str):
+                rel['parent_key'] = parent_key
+                rel['child_key'] = child_key
+            fk_relationships.append(rel)
+        # Now enforce all FKs and descriptive mappings
+        return self._enforce_fk_relationships(result_data, fk_relationships)
+    
+    def _enforce_fk_relationships(self, result_data, fk_relationships):
+        """
+        Enforce foreign key relationships in a three-step process:
+        1. Direct mappings (both ParentKey and ChildKey defined)
+        2. Reference mappings (only ParentColumn defined, creating intermediate keys)
+        3. Dependent mappings (rely on intermediate keys created in previous steps)
+        
+        Args:
+            result_data: The DataFrame to update with enforced FKs
+            fk_relationships: List of FK relationship dictionaries
+            
+        Returns:
+            Updated DataFrame with all foreign key relationships enforced
+        """        # Make a deep copy to avoid modifying the original during processing
+        processed_data = result_data.copy()
+        
+        # Step 1: Process direct mappings (both ParentKey and ChildKey defined)
+        direct_mappings = [fk for fk in fk_relationships if fk.get('parent_key') and fk.get('child_key')]
+        logger.info(f"Processing {len(direct_mappings)} direct foreign key mappings")
+        for fk in direct_mappings:
+            parent_table = fk['parent_table']
+            parent_cols = fk['parent_column']
+            child_cols = fk['child_column']
+            parent_key = fk.get('parent_key')
+            child_key = fk.get('child_key')
+            
+            # Check that keys are strings before splitting
+            if not isinstance(parent_key, str):
+                logger.warning(f"Skipping mapping: ParentKey is not a string ({type(parent_key)})")
+                continue
+                
+            if not isinstance(child_key, str):
+                logger.warning(f"Skipping mapping: ChildKey is not a string ({type(child_key)})")
+                continue
+            
+            parent_key_cols = [k.strip() for k in parent_key.split(',')]
+            child_key_cols = [k.strip() for k in child_key.split(',')]
+            
+            # Only enforce if all columns exist
+            if not all(col in self.generated_data[parent_table].columns for col in parent_key_cols + parent_cols):
+                logger.warning(f"Skipping direct mapping: missing columns in parent table {parent_table}")
+                continue
+                
+            if not all(col in processed_data.columns for col in child_key_cols + child_cols):
+                logger.warning(f"Skipping direct mapping: missing columns in child table")
+                continue
+                
+            parent_df = self.generated_data[parent_table]
+            
+            # Build lookup from parent_key tuple to parent_col value
+            parent_lookup = parent_df.set_index(parent_key_cols)[parent_cols[0]].to_dict()
+            
+            for idx in processed_data.index:
+                try:
+                    child_key_tuple = tuple(processed_data.at[idx, k] for k in child_key_cols)
+                    # If only one key, don't wrap in tuple
+                    if len(child_key_cols) == 1:
+                        child_key_tuple = child_key_tuple[0]
+                    
+                    # Check for NaN values
+                    if (isinstance(child_key_tuple, tuple) and any(pd.isna(v) for v in child_key_tuple)) or pd.isna(child_key_tuple):
+                        continue
+                    
+                    if child_key_tuple in parent_lookup:
+                        processed_data.at[idx, child_cols[0]] = parent_lookup[child_key_tuple]
+                except Exception as e:
+                    logger.warning(f"Error processing direct mapping at index {idx}: {str(e)}")
+        
+        # Step 2: Process reference mappings (only ParentColumn defined, creating intermediate keys)
+        reference_mappings = [fk for fk in fk_relationships 
+                             if not fk.get('parent_key') and not fk.get('child_key') 
+                             and fk['parent_table'] in self.generated_data]
+        logger.info(f"Processing {len(reference_mappings)} reference mappings to create intermediate keys")
+        
+        for fk in reference_mappings:
+            parent_table = fk['parent_table']
+            parent_cols = fk['parent_column']
+            child_cols = fk['child_column']
+            
+            if parent_table not in self.generated_data:
+                continue
+                
+            parent_df = self.generated_data[parent_table]
+            
+            if not all(col in parent_df.columns for col in parent_cols):
+                continue
+                
+            if not all(col in processed_data.columns for col in child_cols):
+                continue
+                
+            # Get all valid parent values
+            valid_combos = parent_df[parent_cols].drop_duplicates().values.tolist()
+            
+            if not valid_combos:
+                continue
+                
+            for idx in processed_data.index:
+                child_values = [processed_data.at[idx, col] for col in child_cols]
+                # Check if the value needs to be updated
+                if any(pd.isna(v) for v in child_values) or child_values not in valid_combos:
+                    chosen = random.choice(valid_combos)
+                    for c, val in zip(child_cols, chosen):
+                        processed_data.at[idx, c] = val        # Step 3: Process dependent mappings (relying on intermediate keys created in previous steps)
+        # For this, we need to re-evaluate direct mappings to check if they now have the required intermediate keys
+        dependent_mappings = [fk for fk in direct_mappings]
+        logger.info(f"Processing dependent mappings using intermediate keys")
+        for fk in dependent_mappings:
+            parent_table = fk['parent_table']
+            parent_cols = fk['parent_column']
+            child_cols = fk['child_column']
+            parent_key = fk.get('parent_key')
+            child_key = fk.get('child_key')
+            
+            # Check that keys are strings before splitting
+            if not isinstance(parent_key, str):
+                logger.warning(f"Skipping dependent mapping: ParentKey is not a string ({type(parent_key)})")
+                continue
+                
+            if not isinstance(child_key, str):
+                logger.warning(f"Skipping dependent mapping: ChildKey is not a string ({type(child_key)})")
+                continue
+            
+            parent_key_cols = [k.strip() for k in parent_key.split(',')]
+            child_key_cols = [k.strip() for k in child_key.split(',')]
+            
+            # Only enforce if all columns exist
+            if not all(col in self.generated_data[parent_table].columns for col in parent_key_cols + parent_cols):
+                continue
+                
+            if not all(col in processed_data.columns for col in child_key_cols + child_cols):
+                continue
+                
+            parent_df = self.generated_data[parent_table]
+            
+            # Build lookup from parent_key tuple to parent_col value
+            try:
+                parent_lookup = parent_df.set_index(parent_key_cols)[parent_cols[0]].to_dict()
+            except Exception as e:
+                logger.warning(f"Error building parent lookup for dependent mapping: {str(e)}")
+                continue
+                
+            # Now the data may contain intermediate keys created in Step 2
+            for idx in processed_data.index:
+                try:
+                    child_key_tuple = tuple(processed_data.at[idx, k] for k in child_key_cols)
+                    
+                    # If only one key, don't wrap in tuple
+                    if len(child_key_cols) == 1:
+                        child_key_tuple = child_key_tuple[0]
+                    
+                    # Check for NaN values
+                    if (isinstance(child_key_tuple, tuple) and any(pd.isna(v) for v in child_key_tuple)) or pd.isna(child_key_tuple):
+                        continue
+                    
+                    if child_key_tuple in parent_lookup:
+                        processed_data.at[idx, child_cols[0]] = parent_lookup[child_key_tuple]
+                except Exception as e:
+                    logger.warning(f"Error processing dependent mapping at index {idx}: {str(e)}")
+        
+        return processed_data
+    
+    def _ensure_unique_values(self, table_name: str, data: pd.DataFrame, column_name: str) -> pd.DataFrame:
+        """
+        Ensure that all values in the specified column are unique across both sample and generated data.
+        This is used for columns that have a uniqueness constraint but are not primary keys.
+        """
+        result_data = data.copy()
+        # Gather all existing unique values from sample and generated data
+        existing_values = set(self.data_samples[table_name][column_name].dropna().unique())
+        existing_values.update(self.all_unique_values.get((table_name, column_name), set()))
+        for idx in result_data.index:
+            current_value = result_data.at[idx, column_name]
+            if pd.isna(current_value) or current_value in existing_values:
+                # Generate a new unique value based on the type
+                dtype = result_data[column_name].dtype
+                if pd.api.types.is_numeric_dtype(dtype):
+                    max_val = max([v for v in existing_values if isinstance(v, (int, float))], default=0)
+                    new_value = int(max_val) + 1
+                else:
+                    # For strings, generate a random value with a prefix
+                    prefix = f"{table_name[:3]}_{column_name[:3]}_"
+                    while True:
+                        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                        new_value = f"{prefix}{suffix}"
+                        if new_value not in existing_values:
+                            break
+                result_data.at[idx, column_name] = new_value
+                existing_values.add(new_value)
+        self.all_unique_values[(table_name, column_name)] = existing_values
+        return result_data
+    
+    def save_to_excel(self, output_path: str):
+        """Save all generated data to an Excel file with one sheet per table."""
+        logger.info(f"Saving generated data to {output_path}")
+        
+        # First save as pickle to handle any illegal Excel characters
+        pickle_path = output_path.replace('.xlsx', '.pickle')
+        with open(pickle_path, 'wb') as f:
+            pickle.dump(self.generated_data, f)
+        
+        logger.info(f"Successfully saved {len(self.generated_data)} tables to {pickle_path}")
+        logger.info(f"To convert to Excel, use: python export_data.py {pickle_path} {output_path}")
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Generate realistic mock data for SQL Server.")
+    parser.add_argument("--tables", required=True, help="Path to target_tables.xlsx")
+    parser.add_argument("--fks", required=True, help="Path to fk_mappings.xlsx")
+    parser.add_argument("--uniques", required=True, help="Path to unique_constraints.xlsx")
+    parser.add_argument("--hierarchy", required=True, help="Path to table_hierarchy.xlsx")
+    parser.add_argument("--output", default="output/generated_data.xlsx", help="Output Excel file path")
+    
+    return parser.parse_args()
+
+def main():
+    """Main entry point for the data generation script."""
+    args = parse_args()
+    
+    # Get the config directory from the input files
+    config_dir = os.path.dirname(args.tables)
+    
+    # Setup output directory if it doesn't exist
+    output_dir = os.path.dirname(args.output)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Initialize data generator
+    generator = DataGenerator(config_dir)
+    
+    # Load schemas and sample data
+    generator.load_schemas()
+    
+    # Generate data for all tables
+    generator.generate_all_data()
+    
+    # Save to Excel
+    generator.save_to_excel(args.output)
+    
+    logger.info("Mock data generation complete!")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,246 @@
+"""
+Schema extraction module for SQL Server databases.
+
+This module connects to SQL Server and extracts table schema information,
+primary keys, and foreign key relationships.
+"""
+
+import os
+from typing import Dict, List, Tuple, Any, Optional
+import pandas as pd
+from dotenv import load_dotenv
+import sqlalchemy as sa
+from sqlalchemy.engine import Engine
+import pyodbc
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def get_connection() -> Engine:
+    """Create a SQLAlchemy engine using environment variables for connection details."""
+    load_dotenv()
+    
+    server = os.getenv('DB_SERVER')
+    database = os.getenv('DB_NAME')
+    username = os.getenv('DB_USER')
+    password = os.getenv('DB_PASSWORD')
+    
+    if not all([server, database, username, password]):
+        raise ValueError("Database connection information missing in .env file")
+    
+    # Use the same connection string that works in our test script
+    try:
+        # Direct ODBC connection string that works in test_connection.py
+        conn_str = f"mssql+pyodbc:///?odbc_connect=DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+        engine = sa.create_engine(conn_str, pool_timeout=30, pool_pre_ping=True)
+        
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+            
+        logger.info(f"Connected to database: {database} on server: {server}")
+        return engine
+    except Exception as e:
+        logger.error(f"Error connecting to database: {str(e)}")
+        raise
+
+def get_table_schema(engine: Engine, table_name: str) -> pd.DataFrame:
+    """
+    Extract detailed schema information for a specific table.
+    
+    Returns:
+        DataFrame with columns, data types, constraints, etc.
+    """
+    query = f"""
+    SELECT 
+        c.name AS column_name,
+        t.name AS data_type,
+        c.max_length,
+        c.precision,
+        c.scale,
+        c.is_nullable,
+        c.is_identity,
+        CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS is_primary_key
+    FROM 
+        sys.columns c
+    INNER JOIN 
+        sys.types t ON c.user_type_id = t.user_type_id
+    INNER JOIN 
+        sys.tables tb ON c.object_id = tb.object_id
+    LEFT JOIN 
+        (SELECT ic.column_id, ic.object_id
+         FROM sys.index_columns ic
+         INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+         WHERE i.is_primary_key = 1) pk 
+    ON 
+        c.object_id = pk.object_id AND c.column_id = pk.column_id
+    WHERE 
+        tb.name = '{table_name}'
+    ORDER BY 
+        c.column_id
+    """
+    
+    try:
+        schema_df = pd.read_sql(query, engine)
+        logger.info(f"Retrieved schema for table: {table_name} with {len(schema_df)} columns")
+        return schema_df
+    except Exception as e:
+        logger.error(f"Error retrieving schema for table {table_name}: {str(e)}")
+        raise
+
+def get_primary_keys(engine: Engine, table_name: str) -> List[str]:
+    """Extract primary key column names for a specific table."""
+    query = f"""
+    SELECT c.name AS column_name
+    FROM sys.indexes i
+    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+    INNER JOIN sys.tables t ON i.object_id = t.object_id
+    WHERE i.is_primary_key = 1 AND t.name = '{table_name}'
+    ORDER BY ic.key_ordinal
+    """
+    
+    try:
+        pk_df = pd.read_sql(query, engine)
+        pk_list = pk_df['column_name'].tolist()
+        logger.info(f"Primary keys for {table_name}: {', '.join(pk_list)}")
+        return pk_list
+    except Exception as e:
+        logger.error(f"Error retrieving primary keys for table {table_name}: {str(e)}")
+        raise
+
+def get_foreign_keys(engine: Engine, table_name: Optional[str] = None) -> pd.DataFrame:
+    """
+    Extract foreign key relationships from the database.
+    
+    Args:
+        engine: SQLAlchemy engine connected to the database
+        table_name: If provided, limit results to this table
+        
+    Returns:
+        DataFrame with parent and child table/column relationships
+    """
+    # Base query for all foreign keys
+    query = """
+    SELECT 
+        pt.name AS parent_table,
+        pc.name AS parent_column,
+        ct.name AS child_table,
+        cc.name AS child_column
+    FROM 
+        sys.foreign_key_columns fkc
+    INNER JOIN 
+        sys.tables pt ON fkc.referenced_object_id = pt.object_id
+    INNER JOIN 
+        sys.tables ct ON fkc.parent_object_id = ct.object_id
+    INNER JOIN 
+        sys.columns pc ON fkc.referenced_object_id = pc.object_id AND fkc.referenced_column_id = pc.column_id
+    INNER JOIN 
+        sys.columns cc ON fkc.parent_object_id = cc.object_id AND fkc.parent_column_id = cc.column_id
+    """
+    
+    # Add filter for specific table if provided
+    if table_name:
+        query += f" WHERE ct.name = '{table_name}'"
+    
+    try:
+        fk_df = pd.read_sql(query, engine)
+        if table_name:
+            logger.info(f"Retrieved {len(fk_df)} foreign key relationships for table: {table_name}")
+        else:
+            logger.info(f"Retrieved {len(fk_df)} foreign key relationships from the database")
+        return fk_df
+    except Exception as e:
+        logger.error(f"Error retrieving foreign keys: {str(e)}")
+        raise
+
+def get_table_data_sample(engine: Engine, table_name: str, sample_size: int = 1000) -> pd.DataFrame:
+    """
+    Extract a sample of data from a table for learning patterns.
+    
+    Args:
+        engine: SQLAlchemy engine connected to the database
+        table_name: Name of the table to sample
+        sample_size: Maximum number of rows to retrieve
+        
+    Returns:
+        DataFrame containing sample data
+    """
+    try:
+        # Get total record count
+        count_query = f"SELECT COUNT(*) AS total_rows FROM {table_name}"
+        total_rows = pd.read_sql(count_query, engine).iloc[0]['total_rows']
+        
+        # If table has fewer rows than sample_size, get all rows
+        if total_rows <= sample_size:
+            query = f"SELECT * FROM {table_name}"
+        else:
+            # For larger tables, take a random sample
+            query = f"""
+            SELECT TOP {sample_size} *
+            FROM {table_name}
+            ORDER BY NEWID()
+            """
+        
+        sample_df = pd.read_sql(query, engine)
+        logger.info(f"Retrieved {len(sample_df)} sample rows from table: {table_name}")
+        return sample_df
+    except Exception as e:
+        logger.error(f"Error retrieving data sample for table {table_name}: {str(e)}")
+        raise
+
+def has_is_mock_column(engine: Engine, table_name: str) -> bool:
+    """Check if the table already has an IsMock column."""
+    query = f"""
+    SELECT COUNT(*) AS column_exists
+    FROM sys.columns c
+    INNER JOIN sys.tables t ON c.object_id = t.object_id
+    WHERE t.name = '{table_name}' AND c.name = 'IsMock'
+    """
+    
+    result = pd.read_sql(query, engine)
+    return bool(result.iloc[0]['column_exists'])
+
+def analyze_pk_patterns(data: pd.DataFrame, pk_columns: List[str]) -> Dict[str, str]:
+    """
+    Analyze primary key columns to determine their patterns.
+    
+    Args:
+        data: Sample data from the table
+        pk_columns: List of primary key column names
+        
+    Returns:
+        Dictionary mapping each PK column to its pattern type: 
+        'numeric', 'alphanumeric', 'text', etc.
+    """
+    patterns = {}
+    
+    for pk in pk_columns:
+        if pk not in data.columns:
+            logger.warning(f"Primary key column {pk} not found in sample data")
+            continue
+            
+        # Get non-null values
+        values = data[pk].dropna().astype(str).tolist()
+        if not values:
+            patterns[pk] = 'unknown'
+            continue
+            
+        # Check if all values are numeric
+        if all(str(v).isdigit() for v in values):
+            patterns[pk] = 'numeric'
+        # Check if all values follow alphanumeric pattern with a specific prefix
+        elif all(len(str(v)) > 2 and not str(v)[0].isdigit() for v in values):
+            # Check if values have a consistent prefix pattern
+            prefixes = set(str(v)[0:3] for v in values if len(str(v)) >= 3)
+            if len(prefixes) == 1:
+                patterns[pk] = f'prefixed_{list(prefixes)[0]}'
+            else:
+                patterns[pk] = 'alphanumeric'
+        else:
+            patterns[pk] = 'text'
+    
+    logger.info(f"Analyzed primary key patterns: {patterns}")
+    return patterns
