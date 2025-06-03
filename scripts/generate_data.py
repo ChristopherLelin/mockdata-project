@@ -58,6 +58,9 @@ class DataGenerator:
         self.target_tables = load_target_tables(os.path.join(config_dir, 'target_tables.xlsx'))
         self.fk_mappings = load_fk_mappings(os.path.join(config_dir, 'fk_mappings.xlsx'))
         self.unique_constraints = load_unique_constraints(os.path.join(config_dir, 'unique_constraints.xlsx'))
+        # Load pattern definitions for advanced pattern-driven generation
+        from load_config import load_pattern_definitions
+        self.pattern_definitions = load_pattern_definitions(os.path.join(config_dir, 'pattern_definitions.xlsx'))
         
         # Load table hierarchy if available
         try:
@@ -81,6 +84,8 @@ class DataGenerator:
         self.data_samples = {}
         self.generated_data = {}
         self.all_unique_values = {}
+        # Initialize column_patterns for pattern learning
+        self.column_patterns = {}
         
     def load_schemas(self):
         """Load schema information for all target tables."""
@@ -114,7 +119,118 @@ class DataGenerator:
                 if col in self.data_samples[table_name].columns:
                     self.all_unique_values[(table_name, col)].update(
                         self.data_samples[table_name][col].dropna().unique()                    )
+            # Analyze and store column patterns for this table
+            self._analyze_all_column_patterns(table_name)
     
+    def _analyze_all_column_patterns(self, table_name: str):
+        """
+        Analyze data patterns for all columns in a table.
+        
+        This method examines sample data for each column to identify:
+        - String patterns (e.g., prefixes, formats)
+        - Numeric patterns (sequential, grouped increments)
+        - Date/time patterns
+        - Composite patterns
+        - Column value distributions
+        
+        The identified patterns are stored for use during data generation.
+        """
+        if table_name not in self.data_samples or self.data_samples[table_name].empty:
+            logger.warning(f"No sample data available for table {table_name} to analyze patterns")
+            return
+            
+        # Get sample data and schema for this table
+        sample_data = self.data_samples[table_name]
+        schema_df = self.table_schemas[table_name]
+        
+        # Dictionary to store column patterns
+        self.column_patterns = getattr(self, 'column_patterns', {})
+        self.column_patterns[table_name] = {}
+        
+        # Process each column
+        for _, col_info in schema_df.iterrows():
+            column_name = col_info['column_name']
+            data_type = col_info['data_type']
+            
+            # Skip if column not in sample data
+            if column_name not in sample_data.columns:
+                continue
+                
+            # Get non-null values for this column
+            values = sample_data[column_name].dropna()
+            if len(values) == 0:
+                continue
+                
+            # Store pattern information
+            pattern_info = {
+                'data_type': data_type,
+                'pattern_type': 'unknown',
+                'value_distribution': {},
+                'unique': False
+            }
+            
+            # Check if column has unique values
+            if len(values.unique()) == len(values):
+                pattern_info['unique'] = True
+                
+            # Analyze patterns based on data type
+            if data_type in ('int', 'bigint', 'smallint', 'tinyint', 'decimal', 'numeric'):
+                # Try to convert to numeric for analysis
+                try:
+                    numeric_values = pd.to_numeric(values, errors='coerce').dropna()
+                    if len(numeric_values) > 0:
+                        # Check if values are sequential
+                        sorted_vals = sorted(numeric_values)
+                        if len(sorted_vals) > 1 and all(sorted_vals[i+1] - sorted_vals[i] == 1 for i in range(len(sorted_vals)-1)):
+                            pattern_info['pattern_type'] = 'sequential'
+                        
+                        # Check if values follow other numeric patterns
+                        # Example: grouped increments, multiples, etc.
+                        
+                        # Store value distribution statistics
+                        pattern_info['value_distribution'] = {
+                            'min': float(numeric_values.min()),
+                            'max': float(numeric_values.max()),
+                            'mean': float(numeric_values.mean()),
+                            'median': float(numeric_values.median())
+                        }
+                except Exception as e:
+                    logger.debug(f"Error analyzing numeric pattern for {table_name}.{column_name}: {e}")
+                    
+            elif data_type in ('char', 'varchar', 'nchar', 'nvarchar'):
+                # String pattern analysis
+                string_values = values.astype(str)
+                
+                # Check for common prefixes
+                if len(string_values) > 0:
+                    # Get prefixes of length 1-3 characters
+                    prefix_counts = {}
+                    for prefix_len in range(1, 4):
+                        prefixes = string_values.str[:prefix_len].value_counts()
+                        if prefixes.max() / len(string_values) > 0.5:  # If more than 50% share prefix
+                            prefix_counts[prefix_len] = prefixes.idxmax()
+                    
+                    if prefix_counts:
+                        # Use the longest common prefix
+                        max_len = max(prefix_counts.keys())
+                        pattern_info['pattern_type'] = f'prefixed_{prefix_counts[max_len]}'
+                        
+                # Check for regex patterns
+                # TODO: Implement regex pattern detection
+                        
+            elif data_type in ('datetime', 'date', 'time'):
+                # Date/time pattern analysis
+                # TODO: Implement date/time pattern detection
+                pass
+                
+            # Store the pattern information
+            self.column_patterns[table_name][column_name] = pattern_info
+            
+        # Look for relationships between columns in the same table
+        # TODO: Implement inter-column relationship detection
+        
+        logger.debug(f"Completed pattern analysis for table: {table_name}")
+
     def generate_all_data(self):
         """Generate mock data for all tables in the correct order."""
         for table_name in tqdm(self.generation_order, desc="Generating Tables"):
@@ -195,7 +311,10 @@ class DataGenerator:
         
         # Post-process to ensure all constraints are met
         processed_data = self._post_process_data(table_name, synthetic_data)
-        
+        # Apply learned column patterns to all columns in this table
+        processed_data = self._apply_column_patterns(table_name, processed_data)
+        # Apply pattern_definitions.xlsx rules
+        processed_data = self._apply_pattern_definitions(table_name, processed_data)
         return processed_data
     
     def _create_metadata(self, table_name: str, schema_df: pd.DataFrame) -> Dict[str, Any]:
@@ -351,6 +470,44 @@ class DataGenerator:
         data: pd.DataFrame, 
         column_name: str
     ) -> pd.DataFrame:
+        # If pattern_definitions.xlsx says IncrementFromDB, enforce strict integer sequence and uniqueness
+        # Use case-insensitive comparison for table and column names
+        pattern_row = self.pattern_definitions[
+            (self.pattern_definitions['TableName'].str.upper() == table_name.upper()) &
+            (self.pattern_definitions['ColumnName'].str.upper() == column_name.upper()) &
+            (self.pattern_definitions['PatternType'] == 'IncrementFromDB')
+        ]
+        if not pattern_row.empty:
+            try:
+                # Find the actual table name in data_samples (case-insensitive)
+                actual_table_name = None
+                for sample_table in self.data_samples.keys():
+                    if sample_table.upper() == table_name.upper():
+                        actual_table_name = sample_table
+                        break
+                
+                # Find the actual column name (case-insensitive)
+                actual_col_name = None
+                if actual_table_name:
+                    for col in self.data_samples[actual_table_name].columns:
+                        if col.upper() == column_name.upper():
+                            actual_col_name = col
+                            break
+                
+                if actual_table_name and actual_col_name:
+                    max_val = pd.to_numeric(self.data_samples[actual_table_name][actual_col_name], errors='coerce').max()
+                    if pd.isna(max_val):
+                        max_val = 0
+                else:
+                    max_val = 0
+            except Exception:
+                max_val = 0
+            start_val = int(max_val) + 1
+            # Always assign as integer sequence, guarantee uniqueness
+            data[column_name] = range(start_val, start_val + len(data))
+            data[column_name] = data[column_name].astype(int)
+            return data.drop_duplicates(subset=[column_name]).reset_index(drop=True)
+        
         # Ensure PKs are unique across both sample and generated data, and respect max_length
         result_data = data.copy()
         pattern = self.pk_patterns[table_name].get(column_name, 'unknown')
@@ -361,17 +518,32 @@ class DataGenerator:
         if col_info['data_type'] in ('nchar', 'nvarchar') and max_length:
             max_length = max_length // 2
         # Combine all unique values from sample and generated data
-        existing_values = set(self.data_samples[table_name][column_name].dropna().unique())
+        # Find the actual table and column names (case-insensitive)
+        actual_table_name = None
+        for sample_table in self.data_samples.keys():
+            if sample_table.upper() == table_name.upper():
+                actual_table_name = sample_table
+                break
+        
+        actual_col_name = None
+        if actual_table_name:
+            for col in self.data_samples[actual_table_name].columns:
+                if col.upper() == column_name.upper():
+                    actual_col_name = col
+                    break
+        
+        if actual_table_name and actual_col_name:
+            existing_values = set(self.data_samples[actual_table_name][actual_col_name].dropna().unique())
+        else:
+            existing_values = set()
         existing_values.update(self.all_unique_values.get((table_name, column_name), set()))
         for idx in result_data.index:
             current_value = result_data.at[idx, column_name]
             if pd.isna(current_value) or current_value in existing_values or (max_length and isinstance(current_value, str) and len(current_value) > max_length):
-                # Generate new value based on pattern and max_length
                 if pattern == 'numeric' and pd.api.types.is_numeric_dtype(result_data[column_name].dtype):
                     max_val = max([v for v in existing_values if isinstance(v, (int, float))], default=0)
                     new_value = int(max_val) + 1
                 else:
-                    # For string PKs, generate a unique value that fits max_length
                     prefix = ''
                     suffix_len = max_length if max_length else 8
                     # Try to use a prefix if pattern is prefixed_*
@@ -406,246 +578,295 @@ class DataGenerator:
         self.all_unique_values[(table_name, column_name)] = existing_values
         return result_data
 
-    def _enforce_string_length(
-        self, 
-        data: pd.DataFrame, 
-        column_name: str, 
-        max_length: int
-    ) -> pd.DataFrame:
-        """Ensure string values in a column do not exceed the specified max_length."""
-        result_data = data.copy()
-        if column_name not in result_data.columns:
-            return result_data
-        # Only truncate non-null values
-        mask = result_data[column_name].notna()
-        result_data.loc[mask, column_name] = result_data.loc[mask, column_name].astype(str).str.slice(0, max_length)
-        return result_data
-
-    def _enforce_foreign_keys(self, table_name: str, data: pd.DataFrame) -> pd.DataFrame:
-        """Ensure foreign key values reference only generated parent keys, supporting composite keys and descriptive mappings from fk_mappings.xlsx."""
-        result_data = data.copy()
-        fk_relationships = []
-        fk_df = self.foreign_keys[table_name]
-        for _, row in fk_df.iterrows():
-            fk_relationships.append({
-                'parent_table': row['parent_table'],
-                'parent_column': [row['parent_column']],
-                'child_column': [row['child_column']]            })
-        
-        # Add additional FK mappings, including descriptive mappings
-        additional_fks = self.fk_mappings[
-            (self.fk_mappings['ChildTable'] == table_name)
-        ]
-        for _, row in additional_fks.iterrows():
-            parent_table = row['ParentTable']
-            parent_column = row['ParentColumn']
-            child_column = row['ChildColumn']
-            parent_key = row.get('ParentKey') or row.get('parentKey')
-            child_key = row.get('ChildKey') or row.get('childKey')
-            rel = {
-                'parent_table': parent_table,
-                'parent_column': [parent_column],
-                'child_column': [child_column]
-            }
-            # Only add key mappings if both keys are valid strings
-            if parent_key and child_key and isinstance(parent_key, str) and isinstance(child_key, str):
-                rel['parent_key'] = parent_key
-                rel['child_key'] = child_key
-            fk_relationships.append(rel)
-        # Now enforce all FKs and descriptive mappings
-        return self._enforce_fk_relationships(result_data, fk_relationships)
-    
-    def _enforce_fk_relationships(self, result_data, fk_relationships):
+    def _apply_pattern_definitions(self, table_name: str, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Enforce foreign key relationships in a three-step process:
-        1. Direct mappings (both ParentKey and ChildKey defined)
-        2. Reference mappings (only ParentColumn defined, creating intermediate keys)
-        3. Dependent mappings (rely on intermediate keys created in previous steps)
+        Apply rules from pattern_definitions.xlsx to the generated DataFrame for this table.
+        """
+        patterns = self.pattern_definitions
+        # Use case-insensitive comparison for table names
+        table_patterns = patterns[patterns['TableName'].str.upper() == table_name.upper()]
+        
+        # If no patterns for this table, return unchanged
+        if table_patterns.empty:
+            return df
+        
+        # Make a copy to avoid modifying the original
+        result_df = df.copy()
+        
+        # Apply each pattern type
+        for _, pattern_row in table_patterns.iterrows():
+            col_name = pattern_row['ColumnName']
+            pattern_type = pattern_row['PatternType']
+            # Use GroupByColumn for grouped patterns, PatternFormat for composite patterns
+            group_by_column = pattern_row.get('GroupByColumn')
+            pattern_format = pattern_row.get('PatternFormat')
+            
+            # Skip if column isn't in the dataframe (case-insensitive check)
+            matching_cols = [col for col in result_df.columns if col.upper() == col_name.upper()]
+            if not matching_cols:
+                continue
+            actual_col_name = matching_cols[0]  # Use the actual column name from the dataframe
+                
+            # Handle IncrementFromDB pattern - generate integer values starting from max DB value + 1
+            if pattern_type == 'IncrementFromDB':
+                try:
+                    # Find the actual table name in data_samples (case-insensitive)
+                    actual_table_name = None
+                    for sample_table in self.data_samples.keys():
+                        if sample_table.upper() == table_name.upper():
+                            actual_table_name = sample_table
+                            break
+                    
+                    if actual_table_name and actual_col_name in self.data_samples[actual_table_name].columns:
+                        max_val = pd.to_numeric(self.data_samples[actual_table_name][actual_col_name], errors='coerce').max()
+                        if pd.isna(max_val):
+                            max_val = 0
+                    else:
+                        max_val = 0
+                except Exception:
+                    max_val = 0
+                start_val = int(max_val) + 1
+                result_df[actual_col_name] = range(start_val, start_val + len(result_df))
+                result_df[actual_col_name] = result_df[actual_col_name].astype(int)
+                
+            # Handle GroupedIncrement pattern - generate sequential numbers within groups
+            elif pattern_type == 'GroupedIncrement':
+                # Check if group_by_column exists (case-insensitive)
+                group_col_matches = [col for col in result_df.columns if col.upper() == group_by_column.upper()] if group_by_column else []
+                if group_col_matches:
+                    actual_group_col = group_col_matches[0]
+                    # Get current max value per group from sample data
+                    group_maxes = {}
+                    
+                    # Find the actual table name in data_samples (case-insensitive)
+                    actual_table_name = None
+                    for sample_table in self.data_samples.keys():
+                        if sample_table.upper() == table_name.upper():
+                            actual_table_name = sample_table
+                            break
+                    
+                    if actual_table_name and actual_group_col in self.data_samples[actual_table_name] and actual_col_name in self.data_samples[actual_table_name]:
+                        sample_df = self.data_samples[actual_table_name]
+                        grouped = sample_df.groupby(actual_group_col)[actual_col_name].max()
+                        for group, max_val in grouped.items():
+                            if pd.notna(max_val):
+                                group_maxes[group] = int(max_val)
+                    
+                    # Apply increment within each group
+                    for group in result_df[actual_group_col].unique():
+                        mask = result_df[actual_group_col] == group
+                        start = group_maxes.get(group, 0) + 1
+                        group_size = mask.sum()
+                        result_df.loc[mask, actual_col_name] = range(start, start + group_size)
+                    
+                    result_df[actual_col_name] = result_df[actual_col_name].astype(int)
+                
+            # Handle CompositePattern - generate values using a format string
+            elif pattern_type == 'CompositePattern':
+                if pattern_format:
+                    # Define a function to apply the pattern
+                    def composite(row):
+                        try:
+                            return pattern_format.format(**row.to_dict())
+                        except Exception as e:
+                            logger.warning(f"Failed to apply composite pattern: {e}")
+                            return row[actual_col_name]
+                    
+                    # Apply the function to each row
+                    result_df[actual_col_name] = result_df.apply(composite, axis=1)
+        
+        return result_df
+        
+    def _apply_column_patterns(self, table_name: str, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply learned column patterns to the generated data.
+        
+        This method uses the patterns detected in _analyze_all_column_patterns to 
+        modify the generated data to better match the observed patterns in the sample data.
         
         Args:
-            result_data: The DataFrame to update with enforced FKs
-            fk_relationships: List of FK relationship dictionaries
+            table_name: Name of the table being processed
+            df: DataFrame containing the generated data
             
         Returns:
-            Updated DataFrame with all foreign key relationships enforced
-        """        # Make a deep copy to avoid modifying the original during processing
-        processed_data = result_data.copy()
+            DataFrame with column patterns applied
+        """
+        # Check if we have patterns for this table
+        if table_name not in self.column_patterns:
+            return df
+            
+        # Make a copy to avoid modifying the original
+        result_df = df.copy()
         
-        # Step 1: Process direct mappings (both ParentKey and ChildKey defined)
-        direct_mappings = [fk for fk in fk_relationships if fk.get('parent_key') and fk.get('child_key')]
-        logger.info(f"Processing {len(direct_mappings)} direct foreign key mappings")
-        for fk in direct_mappings:
-            parent_table = fk['parent_table']
-            parent_cols = fk['parent_column']
-            child_cols = fk['child_column']
-            parent_key = fk.get('parent_key')
-            child_key = fk.get('child_key')
-            
-            # Check that keys are strings before splitting
-            if not isinstance(parent_key, str):
-                logger.warning(f"Skipping mapping: ParentKey is not a string ({type(parent_key)})")
-                continue
-                
-            if not isinstance(child_key, str):
-                logger.warning(f"Skipping mapping: ChildKey is not a string ({type(child_key)})")
-                continue
-            
-            parent_key_cols = [k.strip() for k in parent_key.split(',')]
-            child_key_cols = [k.strip() for k in child_key.split(',')]
-            
-            # Only enforce if all columns exist
-            if not all(col in self.generated_data[parent_table].columns for col in parent_key_cols + parent_cols):
-                logger.warning(f"Skipping direct mapping: missing columns in parent table {parent_table}")
-                continue
-                
-            if not all(col in processed_data.columns for col in child_key_cols + child_cols):
-                logger.warning(f"Skipping direct mapping: missing columns in child table")
-                continue
-                
-            parent_df = self.generated_data[parent_table]
-            
-            # Build lookup from parent_key tuple to parent_col value
-            parent_lookup = parent_df.set_index(parent_key_cols)[parent_cols[0]].to_dict()
-            
-            for idx in processed_data.index:
-                try:
-                    child_key_tuple = tuple(processed_data.at[idx, k] for k in child_key_cols)
-                    # If only one key, don't wrap in tuple
-                    if len(child_key_cols) == 1:
-                        child_key_tuple = child_key_tuple[0]
-                    
-                    # Check for NaN values
-                    if (isinstance(child_key_tuple, tuple) and any(pd.isna(v) for v in child_key_tuple)) or pd.isna(child_key_tuple):
-                        continue
-                    
-                    if child_key_tuple in parent_lookup:
-                        processed_data.at[idx, child_cols[0]] = parent_lookup[child_key_tuple]
-                except Exception as e:
-                    logger.warning(f"Error processing direct mapping at index {idx}: {str(e)}")
+        # Get column patterns for this table
+        patterns = self.column_patterns[table_name]
         
-        # Step 2: Process reference mappings (only ParentColumn defined, creating intermediate keys)
-        reference_mappings = [fk for fk in fk_relationships 
-                             if not fk.get('parent_key') and not fk.get('child_key') 
-                             and fk['parent_table'] in self.generated_data]
-        logger.info(f"Processing {len(reference_mappings)} reference mappings to create intermediate keys")
-        
-        for fk in reference_mappings:
-            parent_table = fk['parent_table']
-            parent_cols = fk['parent_column']
-            child_cols = fk['child_column']
+        # Apply patterns to each column
+        for column_name, pattern_info in patterns.items():
+            # Skip if column not in dataframe
+            if column_name not in result_df.columns:
+                continue
+                
+            pattern_type = pattern_info.get('pattern_type', 'unknown')
             
-            if parent_table not in self.generated_data:
-                continue
-                
-            parent_df = self.generated_data[parent_table]
-            
-            if not all(col in parent_df.columns for col in parent_cols):
-                continue
-                
-            if not all(col in processed_data.columns for col in child_cols):
-                continue
-                
-            # Get all valid parent values
-            valid_combos = parent_df[parent_cols].drop_duplicates().values.tolist()
-            
-            if not valid_combos:
-                continue
-                
-            for idx in processed_data.index:
-                child_values = [processed_data.at[idx, col] for col in child_cols]
-                # Check if the value needs to be updated
-                if any(pd.isna(v) for v in child_values) or child_values not in valid_combos:
-                    chosen = random.choice(valid_combos)
-                    for c, val in zip(child_cols, chosen):
-                        processed_data.at[idx, c] = val        # Step 3: Process dependent mappings (relying on intermediate keys created in previous steps)
-        # For this, we need to re-evaluate direct mappings to check if they now have the required intermediate keys
-        dependent_mappings = [fk for fk in direct_mappings]
-        logger.info(f"Processing dependent mappings using intermediate keys")
-        for fk in dependent_mappings:
-            parent_table = fk['parent_table']
-            parent_cols = fk['parent_column']
-            child_cols = fk['child_column']
-            parent_key = fk.get('parent_key')
-            child_key = fk.get('child_key')
-            
-            # Check that keys are strings before splitting
-            if not isinstance(parent_key, str):
-                logger.warning(f"Skipping dependent mapping: ParentKey is not a string ({type(parent_key)})")
-                continue
-                
-            if not isinstance(child_key, str):
-                logger.warning(f"Skipping dependent mapping: ChildKey is not a string ({type(child_key)})")
-                continue
-            
-            parent_key_cols = [k.strip() for k in parent_key.split(',')]
-            child_key_cols = [k.strip() for k in child_key.split(',')]
-            
-            # Only enforce if all columns exist
-            if not all(col in self.generated_data[parent_table].columns for col in parent_key_cols + parent_cols):
-                continue
-                
-            if not all(col in processed_data.columns for col in child_key_cols + child_cols):
-                continue
-                
-            parent_df = self.generated_data[parent_table]
-            
-            # Build lookup from parent_key tuple to parent_col value
-            try:
-                parent_lookup = parent_df.set_index(parent_key_cols)[parent_cols[0]].to_dict()
-            except Exception as e:
-                logger.warning(f"Error building parent lookup for dependent mapping: {str(e)}")
-                continue
-                
-            # Now the data may contain intermediate keys created in Step 2
-            for idx in processed_data.index:
-                try:
-                    child_key_tuple = tuple(processed_data.at[idx, k] for k in child_key_cols)
+            # Apply different transformations based on pattern type
+            if pattern_type == 'sequential':
+                # For sequential patterns, generate sequential values
+                if pd.api.types.is_numeric_dtype(result_df[column_name].dtype):
+                    # Get min value to start sequence
+                    min_val = pattern_info.get('value_distribution', {}).get('min', 0)
+                    # Create sequential values
+                    result_df[column_name] = range(int(min_val), int(min_val) + len(result_df))
                     
-                    # If only one key, don't wrap in tuple
-                    if len(child_key_cols) == 1:
-                        child_key_tuple = child_key_tuple[0]
-                    
-                    # Check for NaN values
-                    if (isinstance(child_key_tuple, tuple) and any(pd.isna(v) for v in child_key_tuple)) or pd.isna(child_key_tuple):
-                        continue
-                    
-                    if child_key_tuple in parent_lookup:
-                        processed_data.at[idx, child_cols[0]] = parent_lookup[child_key_tuple]
-                except Exception as e:
-                    logger.warning(f"Error processing dependent mapping at index {idx}: {str(e)}")
-        
-        return processed_data
+            elif pattern_type.startswith('prefixed_'):
+                # For prefixed patterns, ensure all values have the prefix
+                prefix = pattern_type.split('_', 1)[1]
+                
+                # Only process string columns
+                if pd.api.types.is_string_dtype(result_df[column_name].dtype):
+                    # Add prefix to values that don't already have it
+                    mask = ~result_df[column_name].str.startswith(prefix, na=False)
+                    result_df.loc[mask, column_name] = prefix + result_df.loc[mask, column_name].astype(str)
+            
+            # Handle other pattern types as needed
+            # You can add more pattern handling here based on what patterns you expect to find
+            
+        return result_df
     
     def _ensure_unique_values(self, table_name: str, data: pd.DataFrame, column_name: str) -> pd.DataFrame:
         """
-        Ensure that all values in the specified column are unique across both sample and generated data.
-        This is used for columns that have a uniqueness constraint but are not primary keys.
+        Ensure values in a column are unique according to unique constraints.
+        Similar to _ensure_unique_primary_key but for non-PK columns with uniqueness requirements.
         """
+        # Make a copy to avoid modifying the original
         result_data = data.copy()
-        # Gather all existing unique values from sample and generated data
-        existing_values = set(self.data_samples[table_name][column_name].dropna().unique())
+        
+        # Get the column data type and max length
+        schema_df = self.table_schemas[table_name]
+        col_info = schema_df[schema_df['column_name'] == column_name].iloc[0]
+        data_type = col_info['data_type']
+        max_length = col_info.get('max_length', None)
+        if data_type in ('nchar', 'nvarchar') and max_length:
+            max_length = max_length // 2
+            
+        # Get existing unique values from sample data
+        existing_values = set()
+        if table_name in self.data_samples and column_name in self.data_samples[table_name].columns:
+            existing_values.update(self.data_samples[table_name][column_name].dropna().unique())
+        
+        # Add values we've already seen in this generation run
         existing_values.update(self.all_unique_values.get((table_name, column_name), set()))
+        
+        # Check for patterns in pattern_definitions.xlsx with case-insensitive comparison
+        pattern_row = self.pattern_definitions[
+            (self.pattern_definitions['TableName'].str.upper() == table_name.upper()) &
+            (self.pattern_definitions['ColumnName'].str.upper() == column_name.upper())
+        ]
+        
+        # If using IncrementFromDB pattern, just return the data as it's already unique
+        if not pattern_row.empty and pattern_row.iloc[0]['PatternType'] == 'IncrementFromDB':
+            return result_data
+            
+        # Process each row, fixing non-unique values
         for idx in result_data.index:
             current_value = result_data.at[idx, column_name]
-            if pd.isna(current_value) or current_value in existing_values:
-                # Generate a new unique value based on the type
-                dtype = result_data[column_name].dtype
-                if pd.api.types.is_numeric_dtype(dtype):
-                    max_val = max([v for v in existing_values if isinstance(v, (int, float))], default=0)
+            
+            # Skip if value is NA
+            if pd.isna(current_value):
+                continue
+                
+            # If value already exists in our set of known values, or exceeds max length, replace it
+            if current_value in existing_values or (max_length and isinstance(current_value, str) and len(current_value) > max_length):
+                if pd.api.types.is_numeric_dtype(result_data[column_name].dtype):
+                    # For numeric columns, just increment the max value
+                    numeric_values = [v for v in existing_values if isinstance(v, (int, float))]
+                    max_val = max(numeric_values, default=0)
                     new_value = int(max_val) + 1
                 else:
-                    # For strings, generate a random value with a prefix
-                    prefix = f"{table_name[:3]}_{column_name[:3]}_"
+                    # For string columns, add a suffix to make it unique
+                    prefix = str(current_value)
+                    suffix_len = 4  # Use a smaller suffix than for PKs
+                    
+                    # Truncate prefix if needed to respect max_length
+                    if max_length and len(prefix) + suffix_len > max_length:
+                        prefix = prefix[:max_length - suffix_len]
+                        
+                    # Try to create a unique value
+                    tries = 0
                     while True:
-                        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                        suffix = ''.join(random.choices(string.digits, k=suffix_len))
                         new_value = f"{prefix}{suffix}"
+                        
+                        # Truncate if needed
+                        if max_length and len(new_value) > max_length:
+                            new_value = new_value[:max_length]
+                            
+                        # Check if it's unique
                         if new_value not in existing_values:
                             break
+                            
+                        tries += 1
+                        if tries > 1000:
+                            # If we're struggling, use a longer suffix
+                            suffix_len += 1
+                            tries = 0
+                            
+                        if suffix_len > 10:
+                            # Give up and log error
+                            logger.warning(f"Could not generate unique value for {table_name}.{column_name}")
+                            break
+                
+                # Update the value in the dataframe and add to our set
                 result_data.at[idx, column_name] = new_value
-                existing_values.add(new_value)
+                
+            # Add the value to our set of known values
+            existing_values.add(result_data.at[idx, column_name])
+            
+        # Update the global set of unique values
         self.all_unique_values[(table_name, column_name)] = existing_values
+        
         return result_data
-    
+        
+    def _enforce_string_length(self, data: pd.DataFrame, column_name: str, max_length: int) -> pd.DataFrame:
+        """
+        Enforce maximum string length for a column in the DataFrame.
+        
+        Args:
+            data: DataFrame to process
+            column_name: Name of the column to enforce length constraints
+            max_length: Maximum allowed length for strings
+            
+        Returns:
+            DataFrame with string length constraints enforced
+        """
+        if column_name not in data.columns:
+            return data
+            
+        # Make a copy to avoid modifying the original
+        result_data = data.copy()
+        
+        # Only process string values
+        string_mask = result_data[column_name].apply(lambda x: isinstance(x, str))
+        
+        # Check which strings exceed the maximum length
+        length_mask = result_data.loc[string_mask, column_name].str.len() > max_length
+        
+        # Combine masks to get only string values that exceed max_length
+        combined_mask = pd.Series(False, index=result_data.index)
+        combined_mask[string_mask.index[string_mask]] = length_mask
+        
+        # Truncate strings that are too long
+        if combined_mask.any():
+            # Count how many values were truncated
+            truncated_count = combined_mask.sum()
+            if truncated_count > 0:
+                logger.debug(f"Truncated {truncated_count} values in column {column_name} to max length {max_length}")
+                
+            # Perform truncation
+            result_data.loc[combined_mask, column_name] = result_data.loc[combined_mask, column_name].str.slice(0, max_length)
+            
+        return result_data
+
     def save_to_excel(self, output_path: str):
         """Save all generated data to an Excel file with one sheet per table."""
         logger.info(f"Saving generated data to {output_path}")
@@ -657,6 +878,187 @@ class DataGenerator:
         
         logger.info(f"Successfully saved {len(self.generated_data)} tables to {pickle_path}")
         logger.info(f"To convert to Excel, use: python export_data.py {pickle_path} {output_path}")
+
+    def _enforce_foreign_keys(self, table_name: str, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensure foreign key values reference only generated parent keys, supporting 
+        composite keys and descriptive mappings from fk_mappings.xlsx.
+        
+        Two scenarios:
+        1. If ChildKey is empty: Direct FK mapping (ChildColumn gets values from ParentColumn)
+        2. If ChildKey is populated: Indirect FK mapping (ChildColumn gets values from ParentColumn 
+           based on matching ChildKey with ParentKey)
+        
+        Args:
+            table_name: Name of the table being processed
+            data: DataFrame containing the generated data
+            
+        Returns:
+            DataFrame with foreign key constraints enforced
+        """
+        result_data = data.copy()
+        
+        # Get foreign keys from database schema - these are always direct mappings
+        fk_df = self.foreign_keys[table_name]
+        for _, row in fk_df.iterrows():
+            result_data = self._enforce_direct_fk(
+                result_data, 
+                row['parent_table'], 
+                row['parent_column'], 
+                row['child_column']
+            )
+            
+        # Process additional FK mappings from fk_mappings.xlsx
+        additional_fks = self.fk_mappings[
+            (self.fk_mappings['ChildTable'] == table_name)
+        ]
+        
+        for _, row in additional_fks.iterrows():
+            parent_table = row['ParentTable']
+            parent_column = row['ParentColumn']
+            child_column = row['ChildColumn']
+            parent_key = row.get('ParentKey')
+            child_key = row.get('ChildKey')
+            
+            # Handle NaN values (pandas reads empty cells as NaN)
+            if pd.isna(parent_key):
+                parent_key = None
+            if pd.isna(child_key):
+                child_key = None
+                
+            if child_key is None or child_key == '':
+                # Scenario 1: Direct FK mapping (ChildKey is empty)
+                logger.info(f"Applying direct FK mapping: {table_name}.{child_column} -> {parent_table}.{parent_column}")
+                result_data = self._enforce_direct_fk(
+                    result_data, 
+                    parent_table, 
+                    parent_column, 
+                    child_column
+                )
+            else:
+                # Scenario 2: Indirect FK mapping (ChildKey is populated)
+                logger.info(f"Applying indirect FK mapping: {table_name}.{child_column} -> {parent_table}.{parent_column} based on {child_key} -> {parent_key}")
+                result_data = self._enforce_indirect_fk(
+                    result_data,
+                    parent_table,
+                    parent_column,
+                    parent_key,
+                    child_column,
+                    child_key
+                )
+            
+        return result_data
+    
+    def _enforce_direct_fk(self, data: pd.DataFrame, parent_table: str, parent_column: str, child_column: str) -> pd.DataFrame:
+        """
+        Enforce direct foreign key mapping: ChildColumn gets values directly from ParentColumn.
+        
+        Args:
+            data: DataFrame to update
+            parent_table: Name of the parent table
+            parent_column: Column in parent table to get values from
+            child_column: Column in child table to update
+            
+        Returns:
+            Updated DataFrame
+        """
+        if parent_table not in self.generated_data:
+            logger.warning(f"Parent table {parent_table} not yet generated, skipping FK enforcement")
+            return data
+            
+        parent_df = self.generated_data[parent_table]
+        
+        if parent_column not in parent_df.columns:
+            logger.warning(f"Parent column {parent_column} not found in table {parent_table}")
+            return data
+            
+        if child_column not in data.columns:
+            logger.warning(f"Child column {child_column} not found in child table")
+            return data
+            
+        # Get all valid parent values (remove NaN and duplicates)
+        valid_parent_values = parent_df[parent_column].dropna().unique().tolist()
+        
+        if not valid_parent_values:
+            logger.warning(f"No valid values found in {parent_table}.{parent_column}")
+            return data
+            
+        result_data = data.copy()
+        
+        # Update each row in the child table
+        for idx in result_data.index:
+            # Randomly select a valid parent value
+            chosen_value = random.choice(valid_parent_values)
+            result_data.at[idx, child_column] = chosen_value
+            
+        logger.info(f"Updated {len(result_data)} rows in column {child_column} with values from {parent_table}.{parent_column}")
+        return result_data
+        
+    def _enforce_indirect_fk(self, data: pd.DataFrame, parent_table: str, parent_column: str, 
+                            parent_key: str, child_column: str, child_key: str) -> pd.DataFrame:
+        """
+        Enforce indirect foreign key mapping: ChildColumn gets values from ParentColumn 
+        based on matching ChildKey with ParentKey.
+        
+        Args:
+            data: DataFrame to update
+            parent_table: Name of the parent table
+            parent_column: Column in parent table to get values from
+            parent_key: Key column in parent table for matching
+            child_column: Column in child table to update
+            child_key: Key column in child table for matching
+            
+        Returns:
+            Updated DataFrame
+        """
+        if parent_table not in self.generated_data:
+            logger.warning(f"Parent table {parent_table} not yet generated, skipping FK enforcement")
+            return data
+            
+        parent_df = self.generated_data[parent_table]
+        
+        # Validate columns exist
+        for col, table in [(parent_column, parent_table), (parent_key, parent_table)]:
+            if col not in parent_df.columns:
+                logger.warning(f"Column {col} not found in table {table}")
+                return data
+                
+        for col in [child_column, child_key]:
+            if col not in data.columns:
+                logger.warning(f"Column {col} not found in child table")
+                return data
+        
+        # Create lookup dictionary: parent_key -> parent_column value
+        parent_lookup = {}
+        for _, row in parent_df.iterrows():
+            key_val = row[parent_key]
+            col_val = row[parent_column]
+            if pd.notna(key_val) and pd.notna(col_val):
+                parent_lookup[key_val] = col_val
+                
+        if not parent_lookup:
+            logger.warning(f"No valid lookup values found in {parent_table}")
+            return data
+            
+        result_data = data.copy()
+        updated_count = 0
+        
+        # Update child column based on child key matches
+        for idx in result_data.index:
+            child_key_value = result_data.at[idx, child_key]
+            
+            if pd.notna(child_key_value) and child_key_value in parent_lookup:
+                result_data.at[idx, child_column] = parent_lookup[child_key_value]
+                updated_count += 1
+            else:
+                # If no match found, assign a random valid value from parent
+                if parent_lookup:
+                    result_data.at[idx, child_column] = random.choice(list(parent_lookup.values()))
+                    updated_count += 1
+                    
+        logger.info(f"Updated {updated_count} rows in column {child_column} based on {child_key} -> {parent_key} mapping")
+        return result_data
+        
 
 def parse_args():
     """Parse command-line arguments."""

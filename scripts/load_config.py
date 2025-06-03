@@ -128,6 +128,31 @@ def load_table_hierarchy(file_path: str) -> Optional[pd.DataFrame]:
         logger.error(f"Error loading table hierarchy from {file_path}: {str(e)}")
         raise
 
+def load_pattern_definitions(file_path: str) -> pd.DataFrame:
+    """
+    Load pattern definitions from Excel.
+    
+    Args:
+        file_path: Path to the pattern_definitions.xlsx file
+        
+    Returns:
+        DataFrame with columns: TableName, ColumnName, PatternType, GroupByColumn, PatternFormat
+    """
+    try:
+        df = pd.read_excel(file_path)
+        required_columns = ['TableName', 'ColumnName', 'PatternType']
+        
+        # Validate required columns exist
+        for col in required_columns:
+            if col not in df.columns:
+                raise ValueError(f"Required column '{col}' not found in {file_path}")
+        
+        logger.info(f"Loaded {len(df)} pattern definitions from {file_path}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading pattern definitions from {file_path}: {str(e)}")
+        raise
+
 def determine_generation_order(
     target_tables: pd.DataFrame, 
     fk_mappings: pd.DataFrame,
