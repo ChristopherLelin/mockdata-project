@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Logs
+*.log
+
+# Python test cache
+.cache/
+*.pytest_cache/
+
+# Environment variables or config
+*.env
+.env.*
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# VS Code / IDEs
+.vscode/
+.idea/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Local databases (optional)
+*.sqlite3
+*.db
+
+# Pip install metadata
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
+
+# Coverage reports
+htmlcov/
+.coverage
+coverage.xml
+
+# SDV metadata if used
+sdv_metadata/
